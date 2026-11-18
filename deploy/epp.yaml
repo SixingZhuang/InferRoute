@@ -1,0 +1,269 @@
+# Routing layer: the llm-d router (EPP) plus an Envoy proxy in one pod.
+#
+# Request path:
+#   client -> NodePort 30080 -> Envoy :8081
+#          -> Envoy asks the EPP (ext_proc, gRPC :9002) "which replica?"
+#          -> EPP scores the replicas with the active policy (ConfigMap
+#             epp-config, see policies/) and returns the chosen pod IP in the
+#             x-gateway-destination-endpoint header
+#          -> Envoy forwards the request straight to that pod.
+#
+# No Gateway API implementation is installed; Envoy is configured by hand,
+# which keeps the cluster light enough for an 8 GB laptop.
+---
+# The set of replicas the EPP may route to: every pod labelled app=vllm-sim.
+apiVersion: inference.networking.k8s.io/v1
+kind: InferencePool
+metadata:
+  name: vllm-sim-pool
+  namespace: inferroute
+spec:
+  selector:
+    matchLabels: {app: vllm-sim}
+  targetPorts:
+    - number: 8000
+  endpointPickerRef:
+    name: epp
+    kind: Service
+    port: {number: 9002}
+---
+# The EPP watches pods and InferencePools, so it needs read access to them.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: epp
+  namespace: inferroute
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: epp
+  namespace: inferroute
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+  - apiGroups: [inference.networking.k8s.io]
+    resources: [inferencepools]
+    verbs: [get, list, watch]
+  - apiGroups: [inference.networking.x-k8s.io]
+    resources: [inferencepools, inferenceobjectives, inferencemodelrewrites]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: epp
+  namespace: inferroute
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: epp
+subjects:
+  - kind: ServiceAccount
+    name: epp
+    namespace: inferroute
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: envoy-config
+  namespace: inferroute
+data:
+  envoy.yaml: |
+    admin:
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 19000 }
+    static_resources:
+      listeners:
+        # Main listener: every request is sent to the EPP first (ext_proc).
+        - name: http
+          address:
+            socket_address: { address: 0.0.0.0, port_value: 8081 }
+          filter_chains:
+            - filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: gateway
+                    route_config:
+                      name: inference
+                      virtual_hosts:
+                        - name: inference
+                          domains: ["*"]
+                          routes:
+                            - match: { prefix: "/" }
+                              route:
+                                cluster: picked_replica
+                                timeout: 86400s
+                                idle_timeout: 86400s
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_proc:
+                                  "@type": type.googleapis.com/envoy.config.route.v3.FilterConfig
+                                  config: {}
+                    http_filters:
+                      - name: envoy.filters.http.ext_proc
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+                          grpc_service:
+                            envoy_grpc:
+                              cluster_name: epp
+                            timeout: 10s
+                          processing_mode:
+                            request_header_mode: SEND
+                            response_header_mode: SEND
+                            request_body_mode: FULL_DUPLEX_STREAMED
+                            response_body_mode: FULL_DUPLEX_STREAMED
+                            request_trailer_mode: SEND
+                            response_trailer_mode: SEND
+                          message_timeout: 1000s
+                      - name: envoy.filters.http.router
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                          suppress_envoy_headers: true
+        # Readiness endpoint for the kubelet probe.
+        - name: ready
+          address:
+            socket_address: { address: 0.0.0.0, port_value: 19001 }
+          filter_chains:
+            - filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: ready
+                    route_config:
+                      name: ready
+                      virtual_hosts:
+                        - name: ready
+                          domains: ["*"]
+                          routes:
+                            - match: { prefix: "/ready" }
+                              direct_response: { status: 200, body: { inline_string: "ok" } }
+                    http_filters:
+                      - name: envoy.filters.http.router
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+      clusters:
+        # Forward to whichever pod IP the EPP put in the header.
+        - name: picked_replica
+          type: ORIGINAL_DST
+          connect_timeout: 1000s
+          lb_policy: CLUSTER_PROVIDED
+          original_dst_lb_config:
+            use_http_header: true
+            http_header_name: x-gateway-destination-endpoint
+          circuit_breakers:
+            thresholds:
+              - max_connections: 40000
+                max_pending_requests: 40000
+                max_requests: 40000
+        # The EPP runs in the same pod, so it is reachable on localhost.
+        - name: epp
+          type: STATIC
+          connect_timeout: 86400s
+          lb_policy: LEAST_REQUEST
+          typed_extension_protocol_options:
+            envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+              "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+              explicit_http_config:
+                http2_protocol_options: {}
+          load_assignment:
+            cluster_name: epp
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address: { address: 127.0.0.1, port_value: 9002 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: epp
+  namespace: inferroute
+  labels: {app: epp}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: epp}
+  template:
+    metadata:
+      labels: {app: epp}
+    spec:
+      serviceAccountName: epp
+      containers:
+        - name: epp
+          image: ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --pool-name=vllm-sim-pool
+            - --pool-namespace=inferroute
+            - --grpc-port=9002
+            - --grpc-health-port=9003
+            - --metrics-port=9090
+            - --secure-serving=false
+            - --metrics-endpoint-auth=false
+            - --tracing=false              # no OTLP collector in this cluster
+            - --config-file=/etc/epp/config.yaml   # the active policy
+            - --zap-encoder=json
+            - --v=3
+          env:
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+          ports:
+            - {containerPort: 9002, name: ext-proc}
+            - {containerPort: 9003, name: grpc-health}
+            - {containerPort: 9090, name: metrics}
+          readinessProbe:
+            grpc: {port: 9003, service: envoy.service.ext_proc.v3.ExternalProcessor}
+            periodSeconds: 2
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {memory: 512Mi}
+          volumeMounts:
+            - {name: epp-config, mountPath: /etc/epp}
+        - name: envoy
+          image: envoyproxy/envoy:distroless-v1.33.2
+          imagePullPolicy: IfNotPresent
+          args: [--config-path, /etc/envoy/envoy.yaml]
+          ports:
+            - {containerPort: 8081, name: http}
+            - {containerPort: 19001, name: ready}
+          readinessProbe:
+            httpGet: {path: /ready, port: 19001}
+            periodSeconds: 2
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          volumeMounts:
+            - {name: envoy-config, mountPath: /etc/envoy}
+      volumes:
+        - name: epp-config
+          configMap: {name: epp-config}      # written by scripts/set-policy.sh
+        - name: envoy-config
+          configMap: {name: envoy-config}
+---
+# Referenced by InferencePool.spec.endpointPickerRef.
+apiVersion: v1
+kind: Service
+metadata:
+  name: epp
+  namespace: inferroute
+spec:
+  selector: {app: epp}
+  ports:
+    - {name: ext-proc, port: 9002, targetPort: 9002}
+    - {name: metrics, port: 9090, targetPort: 9090}
+---
+# The entry point: http://localhost:30080/v1/chat/completions
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: inferroute
+spec:
+  type: NodePort
+  selector: {app: epp}
+  ports:
+    - {name: http, port: 80, targetPort: 8081, nodePort: 30080}

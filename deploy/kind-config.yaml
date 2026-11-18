@@ -1,0 +1,12 @@
+# Single-node kind cluster for InferRoute.
+# The gateway NodePort (30080) is mapped to the host so you can reach it at
+# http://localhost:30080 without port-forwarding.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: inferroute
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30080   # gateway (Envoy -> EPP -> replicas)
+        hostPort: 30080
+        protocol: TCP
