@@ -1,0 +1,32 @@
+# Policy 2 — queue-aware.
+#
+# One signal: each replica's waiting-queue length (vllm:num_requests_waiting).
+# The replica with the shortest queue gets the highest score; the picker
+# sends the request to the top-scoring replica.
+#
+# Schema: llm-d-router v0.9.0 EndpointPickerConfig.
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+  - type: queue-scorer
+  - type: max-score-picker
+  - type: single-profile-handler
+  # The queue scorer reads replica metrics through this data layer. Without
+  # the dataLayer section below, scorers can silently score every replica 0.
+  - type: metrics-data-source
+    parameters:
+      scheme: "http"
+      path: "/metrics"
+      insecureSkipVerify: true
+  - type: core-metrics-extractor
+schedulingProfiles:
+  - name: default
+    plugins:
+      - pluginRef: queue-scorer
+        weight: 1
+      - pluginRef: max-score-picker
+dataLayer:
+  sources:
+    - pluginRef: metrics-data-source
+      extractors:
+        - pluginRef: core-metrics-extractor

@@ -1,0 +1,46 @@
+# Policy 3 — queue + prefix-cache-aware.
+#
+# Same queue signal as Policy 2, plus a prefix-cache signal: how much of
+# this request's prompt prefix the replica is estimated to have cached.
+# Only one variable changes from Policy 2 (the prefix term), so any
+# difference in results is attributable to cache awareness.
+#
+#   score(replica) = 2 * queue_score + 3 * prefix_score
+#
+# The weights set the trade-off between "short line" and "already cached";
+# sweep them (e.g. 3:1, 1:1, 2:3, 1:3) as part of Experiment 1.
+#
+# Schema: llm-d-router v0.9.0 EndpointPickerConfig.
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+  - type: queue-scorer
+  # The router keeps its own approximate record of which prompt prefixes it
+  # sent to which replica (an LRU per replica), and the prefix scorer reads
+  # that record. It does not query the replicas' real caches.
+  - type: approx-prefix-cache-producer
+    parameters:
+      maxPrefixBlocksToMatch: 256
+      lruCapacityPerServer: 31250
+  - type: prefix-cache-scorer
+  - type: max-score-picker
+  - type: single-profile-handler
+  - type: metrics-data-source
+    parameters:
+      scheme: "http"
+      path: "/metrics"
+      insecureSkipVerify: true
+  - type: core-metrics-extractor
+schedulingProfiles:
+  - name: default
+    plugins:
+      - pluginRef: queue-scorer
+        weight: 2
+      - pluginRef: prefix-cache-scorer
+        weight: 3
+      - pluginRef: max-score-picker
+dataLayer:
+  sources:
+    - pluginRef: metrics-data-source
+      extractors:
+        - pluginRef: core-metrics-extractor

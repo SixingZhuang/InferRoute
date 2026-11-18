@@ -1,0 +1,30 @@
+# Policy 1 — load-blind baseline ("round-robin" in our slides).
+#
+# The llm-d router has no strict round-robin picker, so the baseline uses
+# random-picker with NO scorers: every replica is equally likely, regardless
+# of its queue or cache. Over many requests this spreads load like
+# round-robin and, like round-robin, ignores replica state.
+#
+# Schema: llm-d-router v0.9.0 EndpointPickerConfig.
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+  - type: random-picker
+  - type: single-profile-handler
+  # Metrics are still collected so all three policies expose the same
+  # signals in Prometheus; this policy just doesn't use them.
+  - type: metrics-data-source
+    parameters:
+      scheme: "http"
+      path: "/metrics"
+      insecureSkipVerify: true
+  - type: core-metrics-extractor
+schedulingProfiles:
+  - name: default
+    plugins:
+      - pluginRef: random-picker
+dataLayer:
+  sources:
+    - pluginRef: metrics-data-source
+      extractors:
+        - pluginRef: core-metrics-extractor
