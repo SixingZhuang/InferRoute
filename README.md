@@ -42,6 +42,22 @@ make spread N=30
 
 See [policies/README.md](policies/README.md) for what each policy does.
 
+## Experiment 1: routing policies under a burst
+
+```bash
+pip install -r requirements.txt          # httpx, pandas, matplotlib
+make experiment                          # ~6 min: 3 policies x (restart + 80 s of traffic)
+make analyze RUN=results/<run-dir>       # summary.md + 3 charts in that folder
+```
+
+`make experiment` runs identical traffic (same seed) under each policy,
+restarting the replicas in between so every policy starts with cold caches.
+Default traffic: 6 req/s for 30 s, a burst of 20 req/s for 20 s, then 6 req/s
+for 30 s; 60% short, 30% shared-long (24 tenants' ~600-word system prompts),
+10% unique-long (~800-word documents) requests. Change it with `LOADGEN_ARGS`, e.g.
+`LOADGEN_ARGS="--phases 6:30,25:20,6:30" make experiment`; see
+`python3 load/loadgen.py --help`.
+
 ## Layout
 
 | Path | What |
@@ -52,6 +68,9 @@ See [policies/README.md](policies/README.md) for what each policy does.
 | `policies/` | the three routing policies (EPP configs) |
 | `scripts/set-policy.sh` | switch the active policy on a running cluster |
 | `scripts/spread.sh` | send N requests, count requests per replica |
+| `load/loadgen.py` | open-loop bursty load generator; one CSV row per request (TTFT, latency) |
+| `scripts/run_experiment.sh` | run the same traffic under each policy, save CSVs + replica metrics |
+| `analysis/analyze.py` | summary table and charts for one run |
 
 ## Versions
 

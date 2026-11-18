@@ -30,10 +30,19 @@ spec:
             # model; the simulator just times the request.
             - --mode=echo
             - --force-dummy-tokenizer
-            # Cache: simulate a KV cache of 256 blocks so prefix reuse
-            # (and eviction) actually happens.
+            # Cache: 512 blocks x 16 tokens = 8192 tokens per replica.
+            # Sizing (see load/loadgen.py defaults, ~1 token per word):
+            #  - big enough that 8 running requests never exceed it
+            #    (8 x ~51 blocks for the longest prompt = ~408 blocks); the
+            #    simulator rejects a request with "the kv cache does not have
+            #    sufficient capacity" instead of queueing it;
+            #  - too small to hold all 24 tenants' shared prompts
+            #    (24 x ~38 blocks = ~912), so random routing keeps evicting
+            #    them, while 3 replicas together (1536 blocks) can hold them
+            #    all if routing keeps each tenant on one replica.
             - --enable-kvcache
-            - --kv-cache-size=256
+            - --kv-cache-size=512
+            - --block-size=16
             # Capacity: at most 8 requests in a batch; the rest wait in the
             # queue (vllm:num_requests_waiting). Lower this to make queueing,
             # and so routing differences, more visible.

@@ -1,0 +1,5 @@
+date: Wed Nov 18 09:06:09 CST 2026
+git: c2f5745
+policies: round-robin queue-aware queue-cache-aware
+loadgen args: 
+replicas: 3
